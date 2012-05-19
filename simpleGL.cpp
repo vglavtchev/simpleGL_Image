@@ -52,20 +52,24 @@
 // CUDA utilities and system includes
 #include <rendercheck_gl.h>
 #include <helper_functions.h>
+//#include <helper_cuda.h>      // includes for cuda initialization and error checking
 #include <shrQATest.h>    // standard utility and system includes
 #include <vector_types.h>
+#include <limits.h>
 
 #define MAX_EPSILON_ERROR 10.0f
 #define THRESHOLD         0.30f
 #define REFRESH_DELAY     10 //ms
+
+typedef unsigned char Pixel;
 
 ////////////////////////////////////////////////////////////////////////////////
 // constants
 const unsigned int window_width = 512;
 const unsigned int window_height = 512;
 
-const unsigned int mesh_width = 1024;
-const unsigned int mesh_height = 1024;
+unsigned int mesh_width = 1024;
+unsigned int mesh_height = 1024;
 
 // vbo variables
 GLuint vbo;
@@ -96,6 +100,30 @@ bool g_bGLVerify   = false;
 int *pArgc = NULL;
 char **pArgv = NULL;
 
+
+/*
+ * ------ GLOBALS FROM SobelFilter
+ */
+
+unsigned int g_Bpp;
+
+// Display Data
+static GLuint pbo_buffer = 0;  // Front and back CA buffers
+struct cudaGraphicsResource *cuda_pbo_resource; // CUDA Graphics Resource (to transfer PBO)
+
+static GLuint texid = 0;       // Texture for display
+float imageScale = 1.f;        // Image exposure
+
+// Create containers for the original image, the histogram, and the HistEq image
+unsigned int gHistogram[UCHAR_MAX-1];
+unsigned char *pixels = NULL;  // Image pixel data on the host
+unsigned char *hEqImage = NULL;
+
+/*
+ *
+ *
+ */
+
 // CheckFBO/BackBuffer class objects
 CheckRender       *g_CheckRender = NULL;
 
@@ -105,12 +133,18 @@ CheckRender       *g_CheckRender = NULL;
 // kernels
 //#include <simpleGL_kernel.cu>
 
-extern "C"
-void launch_kernel(float4 *pos, unsigned int mesh_width, unsigned int mesh_height, float time);
+extern "C" void launch_kernel(float4 *pos, unsigned int mesh_width, unsigned int mesh_height, float time);
+
+extern "C" void sobelFilter(Pixel *odata, int iw, int ih, float fScale);
+extern "C" void setupTexture(int iw, int ih, Pixel *data, int Bpp);
+extern "C" void deleteTexture(void);
 
 ////////////////////////////////////////////////////////////////////////////////
 // declaration, forward
 bool runTest(int argc, char **argv);
+void loadDefaultImage(char *loc_exec);
+void initializeData(char *file);
+void histogramCreate_CPU(const unsigned char *pixels);
 void cleanup();
 
 // GL functionality
@@ -538,6 +572,153 @@ int findGraphicsGPU(char *name)
     return nGraphicsGPU;
 }
 
+void equalizeImage(const unsigned char* pixels){
+
+	// Create output image
+	hEqImage = (unsigned char*)malloc( sizeof(unsigned char) * mesh_width * mesh_height);
+
+	unsigned int cdf[UCHAR_MAX];
+	unsigned int runningSum = 0;
+
+	for(int i = 0; i < UCHAR_MAX-1; i++){
+		runningSum += gHistogram[i];
+		cdf[i] = runningSum;
+	}
+
+	// Calculate equalized image
+	unsigned int totalElements = (unsigned int)mesh_width * (unsigned int)mesh_height;
+
+	unsigned int currentValue = 0;
+	unsigned int currentResult = 0;
+
+	for(int i = 0; i < mesh_width * mesh_height; i++){
+		currentValue = cdf[ pixels[i] ];
+		currentResult = (currentValue * (UCHAR_MAX-1)) / totalElements;
+		hEqImage[i] = (unsigned char)currentResult;
+	}
+	printf("Finished equalizing\n");
+
+    //FILE *fp;
+    //fopen(fp, "lena_eq.pgm", "wb");
+	char *saveFile = "./data/lena_eq.pgm";
+	sdkSavePGM(saveFile, hEqImage, mesh_width, mesh_height);
+}
+
+void histogramCreate_CPU(const unsigned char *pixels)
+{
+	// Clear out the histogram counts
+    memset(gHistogram, 0x0, sizeof(Pixel) * UCHAR_MAX);
+
+    // Create histogram
+	for(int i = 0; i < mesh_width * mesh_height; i++){
+		gHistogram[ pixels[i] ]++;
+	}
+
+	// Print the histogram in the console
+	/*int count = 0;
+	for(int i = 0; i < UCHAR_MAX; i++){
+		count = gHistogram[i];
+
+		// print a '|' character for each 10 counts for a value
+		if(count > 10){
+			printf("[%d]: |", i);
+			for(int i = 0; i < count; i++){
+				if(count % 10 == 0)
+					printf("|");
+			}
+			printf("\n");
+		}
+	}*/
+}
+
+void initializeData(char *file)
+{
+    GLint bsize;
+    unsigned int w, h;
+    size_t file_length= strlen(file);
+
+    // Load one frame of image
+    if (!strcmp(&file[file_length-3], "pgm"))
+    {
+    	printf("Filename: %s \n", file);
+        if (sdkLoadPGM<unsigned char>(file, &pixels, &w, &h) != true)
+        {
+            printf("Failed to load PGM image file: %s\n", file);
+            exit(-1);
+        }
+        printf("Loaded image successfully.\n");
+
+        g_Bpp = 1;
+    }
+
+    // Create a texture and load the image onto it
+    mesh_width = (int)w;
+    mesh_height = (int)h;
+    setupTexture(mesh_width, mesh_height, pixels, g_Bpp);
+    printf("Texture setup completed. Size: %d x %d\n", mesh_width, mesh_height);
+
+    // Create histogram
+    histogramCreate_CPU(pixels);
+    equalizeImage(pixels);
+
+    //memset(pixels, 0x0, g_Bpp * sizeof(Pixel) * mesh_width * mesh_height);
+
+    if (!g_bQAReadback)
+    {
+        printf("Starting PBO setup.\n");
+
+        // This code creates a PBO for the output image
+        // But in our application it is NOT necessary
+        /*glGenBuffers(1, &pbo_buffer);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_buffer);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                     g_Bpp * sizeof(Pixel) * mesh_width * mesh_height,
+                     pixels, GL_STREAM_DRAW);
+
+        glGetBufferParameteriv(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE, &bsize);
+
+        if ((GLuint)bsize != (g_Bpp * sizeof(Pixel) * mesh_width * mesh_height))
+        {
+            printf("Buffer object (%d) has incorrect size (%d).\n", (unsigned)pbo_buffer, (unsigned)bsize);
+            cudaDeviceReset();
+            exit(-1);
+        }
+
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        // register this buffer object with CUDA
+        checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo_buffer, cudaGraphicsMapFlagsWriteDiscard));
+		*/
+
+        glGenTextures(1, &texid);
+        glBindTexture(GL_TEXTURE_2D, texid);
+        glTexImage2D(GL_TEXTURE_2D, 0, ((g_Bpp==1) ? GL_LUMINANCE : GL_BGRA),
+        		mesh_width, mesh_height,  0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    }
+}
+
+void loadDefaultImage(char *loc_exec)
+{
+
+    printf("Reading image: lena.pgm\n");
+    const char *image_filename = "lena.pgm";
+    char *image_path = sdkFindFilePath(image_filename, loc_exec);
+
+    if (image_path == NULL)
+    {
+        printf("Failed to read image file: <%s>\n", image_filename);
+        shrQAFinishExit2(false, *pArgc, (const char **)pArgv, QA_FAILED);
+    }
+
+    initializeData(image_path);
+    free(image_path);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
@@ -659,7 +840,6 @@ bool initGL(int *argc, char **argv)
     return true;
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 //! Run a simple test for CUDA
 ////////////////////////////////////////////////////////////////////////////////
@@ -667,6 +847,8 @@ bool runTest(int argc, char **argv)
 {
     // Create the CUTIL timer
     sdkCreateTimer(&timer);
+
+    printf("Finished loading image\n");
 
     // command line mode only
     if (g_bQAReadback)
@@ -695,6 +877,9 @@ bool runTest(int argc, char **argv)
         {
             cudaGLSetGLDevice(gpuGetMaxGflopsDeviceId());
         }
+
+        // Load input image into a texture
+        loadDefaultImage(argv[0]);
 
         // register callbacks
         glutDisplayFunc(display);
@@ -809,12 +994,14 @@ void createVBO(GLuint *vbo, struct cudaGraphicsResource **vbo_res,
 
         // register this buffer object with CUDA
         // DEPRECATED: checkCudaErrors(cudaGLRegisterBufferObject(*vbo));
+        printf("Registering VBO with CUDA\n");
         checkCudaErrors(cudaGraphicsGLRegisterBuffer(vbo_res, *vbo, vbo_res_flags));
 
         SDK_CHECK_ERROR_GL();
     }
     else
     {
+    	printf("Allocating VBO\n");
         checkCudaErrors(cudaMalloc((void **)&d_vbo_buffer, mesh_width*mesh_height*4*sizeof(float)));
     }
 }
@@ -888,6 +1075,11 @@ void cleanup()
 {
     sdkDeleteTimer(&timer);
 
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glDeleteBuffers(1, &pbo_buffer);
+    glDeleteTextures(1, &texid);
+    deleteTexture();
+    cudaGraphicsUnregisterResource(cuda_pbo_resource);
     deleteVBO(&vbo, cuda_vbo_resource);
 
     if (g_CheckRender)

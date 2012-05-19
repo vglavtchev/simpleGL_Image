@@ -17,6 +17,29 @@
 #ifndef _SIMPLEGL_KERNEL_H_
 #define _SIMPLEGL_KERNEL_H_
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+
+typedef unsigned char Pixel;
+
+// Texture reference for reading image
+texture<unsigned char, 2> tex;
+static cudaArray *array = NULL;
+
+// This will output the proper CUDA error strings in the event that a CUDA host call returns an error
+#define checkCudaErrors(err)           __checkCudaErrors (err, __FILE__, __LINE__)
+
+inline void __checkCudaErrors(cudaError err, const char *file, const int line)
+{
+    if (cudaSuccess != err)
+    {
+        fprintf(stderr, "%s(%i) : CUDA Runtime API error %d: %s.\n",
+                file, line, (int)err, cudaGetErrorString(err));
+        exit(-1);
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 //! Simple kernel to modify vertex positions in sine wave pattern
 //! @param data  data in global memory
@@ -32,9 +55,15 @@ __global__ void kernel(float4 *pos, unsigned int width, unsigned int height, flo
     u = u*2.0f - 1.0f;
     v = v*2.0f - 1.0f;
 
+    //int i = threadIdx.x + blockDim.x * blockIdx.x;
+    unsigned char pix00 = tex2D(tex, (float) x, (float) y);
+
     // calculate simple sine wave pattern
-    float freq = 4.0f;
-    float w = sinf(u*freq + time) * cosf(v*freq + time) * 0.5f;
+    // float freq = 4.0f;
+    // float w = sinf(u*freq + time) * cosf(v*freq + time) * 0.5f;
+
+    // The vertex's height will be the grayscale value of the image
+    float w = (float)pix00 / (float)UCHAR_MAX; //sinf(u*freq + time) * cosf(v*freq + time) * 0.5f;
 
     // write output vertex
     pos[y*width+x] = make_float4(u, w, v, 1.0f);
@@ -43,10 +72,48 @@ __global__ void kernel(float4 *pos, unsigned int width, unsigned int height, flo
 // Wrapper for the __global__ call that sets up the kernel call
 extern "C" void launch_kernel(float4 *pos, unsigned int mesh_width, unsigned int mesh_height, float time)
 {
+    checkCudaErrors(cudaBindTextureToArray(tex, array));
+
     // execute the kernel
     dim3 block(8, 8, 1);
     dim3 grid(mesh_width / block.x, mesh_height / block.y, 1);
     kernel<<< grid, block>>>(pos, mesh_width, mesh_height, time);
+
+    checkCudaErrors(cudaUnbindTexture(tex));
+}
+
+extern "C" void setupTexture(int iw, int ih, Pixel *data, int Bpp)
+{
+    cudaChannelFormatDesc desc;
+
+    if (Bpp == 1)
+    {
+        desc = cudaCreateChannelDesc<unsigned char>();
+    }
+    else
+    {
+        desc = cudaCreateChannelDesc<uchar4>();
+    }
+
+    checkCudaErrors(cudaMallocArray(&array, &desc, iw, ih));
+    checkCudaErrors(cudaMemcpyToArray(array, 0, 0, data, Bpp*sizeof(Pixel)*iw*ih, cudaMemcpyHostToDevice));
+}
+
+extern "C" void deleteTexture(void)
+{
+    checkCudaErrors(cudaFreeArray(array));
+}
+
+
+// Wrapper for the __global__ call that sets up the texture and threads
+extern "C" void sobelFilter(Pixel *odata, int iw, int ih, float fScale)
+{
+    checkCudaErrors(cudaBindTextureToArray(tex, array));
+
+    // Run the Sobel kernel
+    //SobelTex<<<ih, 384>>>(odata, iw, iw, ih, fScale);
+
+    checkCudaErrors(cudaUnbindTexture(tex));
 }
 
 #endif // #ifndef _SIMPLEGL_KERNEL_H_
